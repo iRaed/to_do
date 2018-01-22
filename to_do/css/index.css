@@ -1,0 +1,60 @@
+html, body, div, h1, ul, li, input, a, span, p{
+    padding: 0;
+    margin: 0;
+    border: 0;
+}
+body{
+    direction: rtl;
+    background-color: #eceff0;
+}
+.container{
+    background-color: #fff;
+    max-width: 500px;
+    margin: 20px auto;
+    padding: 20px;
+    border-radius: 2px;
+    box-sizing: border-box;
+}
+.container .header{
+    margin-bottom: 10px;
+}
+.tasks{
+    list-style-type: none;
+}
+.tasks li, .task-add .input{
+    border-bottom: 1px dashed #ccc;
+    padding: 15px 0;
+}
+.tasks .done{
+    text-decoration: line-through;
+}
+.tasks .date{
+    margin-top: 7px;
+    font-size: 13px;
+}
+.tasks .done-button{
+    text-decoration: none;
+    background-color: #d9dfe1;
+    color: #363639;
+    border-bottom: 1px dashed;
+    padding: 3px 6px;
+    opacity: 0.4;
+}
+.task-add .input{
+    width: 100%;
+}
+.task-add .input:focus{
+    outline: none;
+}
+.task-add .submit{
+   width: 100%;
+   background-color: #fff;
+   margin-top: 10px;
+   padding: 5px 10px;
+   border: 1px solid #ddd;
+   box-shadow: 3px 3px 0 #ddd;
+}
+.error{
+    color: #cc0000;
+    font-size: 12px;
+}
