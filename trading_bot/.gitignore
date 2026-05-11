@@ -1,0 +1,13 @@
+.env
+*.env
+*.db
+data/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+KILL_SWITCH
+.idea/
+.vscode/

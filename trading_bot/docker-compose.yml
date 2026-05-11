@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    image: crypto-trading-bot:latest
+    container_name: crypto-trading-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "-m", "app.main", "run"]
+
+  webhook:
+    build: .
+    image: crypto-trading-bot:latest
+    container_name: crypto-trading-bot-webhook
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "-m", "app.main", "webhook", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"

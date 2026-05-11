@@ -1,0 +1,10 @@
+.env
+*.env
+*.db
+data/
+__pycache__/
+.pytest_cache/
+.git/
+tests/
+*.pyc
+KILL_SWITCH
