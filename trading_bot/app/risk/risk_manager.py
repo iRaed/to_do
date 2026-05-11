@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from ..config import KILL_SWITCH_FILE, Settings
 from ..storage import repository as repo
@@ -38,6 +38,7 @@ class RiskManager:
         signal: Signal,
         *,
         free_quote_balance: Optional[float] = None,
+        balance_fetcher: Optional[Callable[[str], float]] = None,
         min_exchange_notional: Optional[float] = None,
         slippage_pct: Optional[float] = None,
     ) -> RiskDecision:
@@ -96,8 +97,25 @@ class RiskManager:
         if notional < min_notional:
             return RiskDecision(False, f"notional_below_min({min_notional})")
 
-        # Available balance check
-        if free_quote_balance is not None and notional > free_quote_balance:
+        # Hard cap on per-order notional
+        if notional > s.MAX_ORDER_NOTIONAL_USDT:
+            return RiskDecision(False, "order_notional_exceeds_max")
+
+        # Hard cap on cumulative buy notional today
+        traded_today = repo.daily_traded_notional()
+        if (traded_today + notional) > s.MAX_DAILY_NOTIONAL_USDT:
+            return RiskDecision(False, "daily_notional_exceeds_max")
+
+        # Balance check (live-only): prefer fresh fetch if a fetcher is provided
+        if balance_fetcher is not None:
+            try:
+                quote = signal.symbol.split("/")[1]
+                free = float(balance_fetcher(quote))
+                if notional > free:
+                    return RiskDecision(False, "insufficient_balance")
+            except Exception:
+                return RiskDecision(False, "balance_check_failed")
+        elif free_quote_balance is not None and notional > free_quote_balance:
             return RiskDecision(False, "insufficient_balance")
 
         # Max risk cap (defence in depth)

@@ -12,6 +12,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KILL_SWITCH_FILE = PROJECT_ROOT / "KILL_SWITCH"
 
 
+class LiveConfirmationMissing(RuntimeError):
+    """Raised when MODE=live and LIVE_TRADING=true but the human-confirmation flag is missing."""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
@@ -23,6 +27,7 @@ class Settings(BaseSettings):
     # Mode / safety
     MODE: Literal["paper", "live"] = "paper"
     LIVE_TRADING: bool = False
+    I_UNDERSTAND_THIS_CAN_LOSE_MONEY: bool = False
 
     # Exchange
     EXCHANGE: str = "binance"
@@ -42,6 +47,8 @@ class Settings(BaseSettings):
     MAX_DAILY_LOSS: float = 0.10
     MAX_CONSECUTIVE_LOSSES: int = 4
     MAX_TRADES_PER_DAY: int = 10
+    MAX_ORDER_NOTIONAL_USDT: float = 250.0
+    MAX_DAILY_NOTIONAL_USDT: float = 1000.0
 
     # Strategy exits
     STOP_LOSS_PCT: float = 0.025
@@ -62,9 +69,11 @@ class Settings(BaseSettings):
     # Telegram
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    HEARTBEAT_HOURS: int = 6
 
     # Webhooks
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
+    COMMAND_SECRET: str = ""
 
     # Kill switch
     KILL_SWITCH_CLOSE_POSITIONS: bool = False
@@ -91,25 +100,35 @@ class Settings(BaseSettings):
         return v
 
     @property
-    def is_live(self) -> bool:
-        """Real money trading is enabled only when both flags align."""
+    def live_requested(self) -> bool:
+        """True if env asks for live trading, regardless of confirmation."""
         return self.MODE == "live" and self.LIVE_TRADING is True
+
+    @property
+    def is_live(self) -> bool:
+        """Real money trading is enabled only when ALL three gates align."""
+        return self.live_requested and self.I_UNDERSTAND_THIS_CAN_LOSE_MONEY is True
+
+    def assert_live_allowed(self) -> None:
+        """Raise if MODE=live + LIVE_TRADING=true but I_UNDERSTAND... is not set."""
+        if self.live_requested and not self.I_UNDERSTAND_THIS_CAN_LOSE_MONEY:
+            raise LiveConfirmationMissing(
+                "Refusing to start: MODE=live and LIVE_TRADING=true but "
+                "I_UNDERSTAND_THIS_CAN_LOSE_MONEY is not set to true. "
+                "Add I_UNDERSTAND_THIS_CAN_LOSE_MONEY=true to .env to acknowledge "
+                "that this bot can lose real money."
+            )
 
     @property
     def kill_switch_active(self) -> bool:
         return KILL_SWITCH_FILE.exists()
 
     def safe_dump(self) -> dict:
-        """Return config dict with secrets redacted, safe for logs."""
         d = self.model_dump()
-        for secret_key in (
-            "BINANCE_API_KEY",
-            "BINANCE_API_SECRET",
-            "TELEGRAM_BOT_TOKEN",
-            "TRADINGVIEW_WEBHOOK_SECRET",
-        ):
-            if d.get(secret_key):
-                d[secret_key] = "***REDACTED***"
+        for k in ("BINANCE_API_KEY", "BINANCE_API_SECRET", "TELEGRAM_BOT_TOKEN",
+                  "TRADINGVIEW_WEBHOOK_SECRET", "COMMAND_SECRET"):
+            if d.get(k):
+                d[k] = "***REDACTED***"
         return d
 
 

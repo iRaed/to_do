@@ -1,14 +1,9 @@
-"""FastAPI endpoint for TradingView webhooks.
+"""FastAPI endpoints.
 
-POST /webhook/tradingview
-{
-    "secret": "shared-secret",
-    "symbol": "BTC/USDT",
-    "side": "buy",
-    "strategy": "TV_BREAKOUT",
-    "price": 65000,
-    "timeframe": "5m"
-}
+- POST /webhook/tradingview  — TradingView entry signal webhook
+- POST /command              — emergency command bus (status / kill / positions)
+  Body: {"secret": "...", "command": "status|kill|positions"}
+- GET  /health
 """
 from __future__ import annotations
 
@@ -18,11 +13,12 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..alerts.telegram import build_telegram_from_settings
-from ..config import get_settings
+from ..config import KILL_SWITCH_FILE, get_settings
 from ..execution.order_manager import OrderManager
 from ..execution.paper_broker import PaperBroker
 from ..risk.risk_manager import RiskManager
 from ..storage import repository as repo
+from ..storage.db import init_db
 from ..strategy.base import Signal
 from ..utils.logger import get_logger, log_event
 
@@ -39,6 +35,11 @@ class TVPayload(BaseModel):
     timeframe: Optional[str] = None
 
 
+class CommandPayload(BaseModel):
+    secret: str = Field(..., min_length=1)
+    command: str
+
+
 def _safe_payload(p: TVPayload) -> dict:
     return {"symbol": p.symbol, "side": p.side, "strategy": p.strategy, "price": p.price, "timeframe": p.timeframe}
 
@@ -46,12 +47,19 @@ def _safe_payload(p: TVPayload) -> dict:
 def create_app() -> FastAPI:
     app = FastAPI(title="Crypto Trading Bot Webhook", version="0.1.0")
     settings = get_settings()
+    init_db()
     tg = build_telegram_from_settings()
     risk = RiskManager(settings)
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "mode": settings.MODE, "live": settings.is_live}
+        return {
+            "status": "ok",
+            "mode": settings.MODE,
+            "live": settings.is_live,
+            "kill_switch": settings.kill_switch_active,
+            "open_positions": len(repo.get_open_positions()),
+        }
 
     @app.post("/webhook/tradingview")
     async def tradingview(request: Request):
@@ -81,9 +89,7 @@ def create_app() -> FastAPI:
             return {"accepted": False, "reason": "duplicate_signal_5min"}
 
         signal = Signal(
-            symbol=payload.symbol,
-            side="buy",
-            price=payload.price,
+            symbol=payload.symbol, side="buy", price=payload.price,
             stop_loss=payload.price * (1.0 - settings.STOP_LOSS_PCT),
             take_profit_1=payload.price * (1.0 + settings.TP1_PCT),
             take_profit_2=payload.price * (1.0 + settings.TP2_PCT),
@@ -93,13 +99,9 @@ def create_app() -> FastAPI:
 
         decision = risk.evaluate(signal)
         repo.save_signal(
-            symbol=signal.symbol,
-            side=signal.side,
-            strategy_name=signal.strategy_name,
-            price=signal.price,
-            raw=_safe_payload(payload),
-            accepted=decision.approved,
-            rejection_reason=decision.reason,
+            symbol=signal.symbol, side=signal.side, strategy_name=signal.strategy_name,
+            price=signal.price, raw=_safe_payload(payload),
+            accepted=decision.approved, rejection_reason=decision.reason,
         )
 
         if not decision.approved:
@@ -107,7 +109,6 @@ def create_app() -> FastAPI:
             return {"accepted": False, "reason": decision.reason}
 
         if settings.is_live:
-            # Lazy import to avoid CCXT/exchange instantiation at module load
             from ..exchange.binance_ccxt import build_binance_from_settings
             from ..execution.live_broker import LiveBroker
 
@@ -131,6 +132,57 @@ def create_app() -> FastAPI:
                 "take_profit_2": signal.take_profit_2, "strategy_name": signal.strategy_name,
             })
             return {"accepted": ok, "mode": "paper"}
+
+    # ---- Emergency command endpoint ----
+
+    @app.post("/command")
+    async def command(payload: CommandPayload):
+        if not settings.COMMAND_SECRET:
+            raise HTTPException(status_code=503, detail="command_secret_not_configured")
+        if payload.secret != settings.COMMAND_SECRET:
+            log_event(logger, "warning", "command_invalid_secret", command=payload.command)
+            raise HTTPException(status_code=401, detail="invalid_secret")
+
+        cmd = payload.command.strip().lower().lstrip("/")
+        log_event(logger, "info", "command_received", command=cmd)
+
+        if cmd == "status":
+            return {
+                "mode": settings.MODE,
+                "live": settings.is_live,
+                "kill_switch": settings.kill_switch_active,
+                "symbols": settings.SYMBOLS,
+                "timeframe": settings.TIMEFRAME,
+                "open_positions": len(repo.get_open_positions()),
+                "trades_today": repo.trades_today_count(),
+                "daily_pnl_pct": repo.daily_pnl_pct(settings.ACCOUNT_EQUITY),
+                "daily_notional_usdt": repo.daily_traded_notional(),
+                "consecutive_losses": repo.consecutive_losses(),
+            }
+        if cmd == "kill":
+            KILL_SWITCH_FILE.write_text("kill")
+            repo.log_bot_event("kill_switch_created", "kill switch via /command", severity="warning")
+            tg.kill_switch()
+            return {"kill_switch": True}
+        if cmd == "unkill":
+            if KILL_SWITCH_FILE.exists():
+                KILL_SWITCH_FILE.unlink()
+                repo.log_bot_event("kill_switch_removed", "kill switch removed via /command")
+            return {"kill_switch": False}
+        if cmd == "positions":
+            positions = repo.get_open_positions()
+            return {
+                "open_positions": [
+                    {
+                        "id": p.id, "symbol": p.symbol, "side": p.side, "mode": p.mode,
+                        "entry": p.entry_price, "qty": p.quantity,
+                        "sl": p.stop_loss, "tp1": p.take_profit_1, "tp2": p.take_profit_2,
+                        "tp1_hit": bool(p.tp1_hit), "trailing": p.trailing_stop,
+                    }
+                    for p in positions
+                ]
+            }
+        raise HTTPException(status_code=400, detail="unknown_command")
 
     return app
 

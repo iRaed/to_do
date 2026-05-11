@@ -6,7 +6,11 @@ import re
 import sys
 from typing import Any
 
-from pythonjsonlogger import jsonlogger
+try:
+    # python-json-logger >= 3.x
+    from pythonjsonlogger.json import JsonFormatter as _BaseFormatter
+except ImportError:  # pragma: no cover - fallback for older versions
+    from pythonjsonlogger.jsonlogger import JsonFormatter as _BaseFormatter  # type: ignore
 
 
 SECRET_PATTERNS = [
@@ -21,10 +25,9 @@ def _redact(text: str) -> str:
     return text
 
 
-class RedactingFormatter(jsonlogger.JsonFormatter):
+class RedactingFormatter(_BaseFormatter):
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-        formatted = super().format(record)
-        return _redact(formatted)
+        return _redact(super().format(record))
 
 
 _configured = False
@@ -40,8 +43,7 @@ def configure_logging(level: str = "INFO") -> None:
         root.removeHandler(h)
 
     handler = logging.StreamHandler(sys.stdout)
-    fmt = RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    handler.setFormatter(fmt)
+    handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root.addHandler(handler)
     _configured = True
 
@@ -53,5 +55,4 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def log_event(logger: logging.Logger, level: str, event: str, **fields: Any) -> None:
-    """Emit a structured event with arbitrary fields as JSON extras."""
     getattr(logger, level.lower())(event, extra={"event": event, **fields})

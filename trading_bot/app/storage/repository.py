@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 from sqlalchemy import desc, select
 
@@ -135,6 +135,18 @@ def daily_pnl_pct(account_equity: float) -> float:
         if account_equity <= 0:
             return 0.0
         return pnl / account_equity
+
+
+def daily_traded_notional() -> float:
+    """Sum of (price * quantity) for buy orders filled today (any mode)."""
+    start = utc_today_start()
+    with session_scope() as s:
+        q = select(Order).where(
+            Order.timestamp >= start,
+            Order.status == "filled",
+            Order.side == "buy",
+        )
+        return float(sum((o.price or 0.0) * (o.quantity or 0.0) for o in s.execute(q).scalars()))
 
 
 # ---------- Orders ----------

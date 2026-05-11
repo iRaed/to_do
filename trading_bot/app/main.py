@@ -5,6 +5,7 @@ import json
 import signal as os_signal
 import sys
 import time
+from datetime import timedelta
 from typing import List, Optional
 
 import pandas as pd
@@ -13,7 +14,12 @@ from rich.console import Console
 from rich.table import Table
 
 from .alerts.telegram import build_telegram_from_settings
-from .config import KILL_SWITCH_FILE, get_settings, reload_settings
+from .config import (
+    KILL_SWITCH_FILE,
+    LiveConfirmationMissing,
+    get_settings,
+    reload_settings,
+)
 from .exchange.binance_ccxt import build_binance_from_settings
 from .execution.order_manager import OrderManager
 from .execution.paper_broker import PaperBroker
@@ -23,6 +29,7 @@ from .storage.db import init_db
 from .strategy.indicators import ema
 from .strategy.momentum_breakout import MomentumBreakoutStrategy
 from .utils.logger import configure_logging, get_logger, log_event
+from .utils.time_utils import utc_now
 
 
 cli = typer.Typer(add_completion=False, help="Personal crypto trading bot (spot, v1)")
@@ -55,6 +62,37 @@ def _build_broker(settings):
     return PaperBroker(settings), build_binance_from_settings()
 
 
+def _build_startup_checklist(settings) -> List[str]:
+    return [
+        f"mode: {settings.MODE}",
+        f"live trading enabled: {settings.is_live}",
+        f"  LIVE_TRADING={settings.LIVE_TRADING}",
+        f"  I_UNDERSTAND_THIS_CAN_LOSE_MONEY={settings.I_UNDERSTAND_THIS_CAN_LOSE_MONEY}",
+        f"symbols: {', '.join(settings.SYMBOLS)}",
+        f"timeframe: {settings.TIMEFRAME}",
+        f"risk per trade: {settings.RISK_PER_TRADE:.2%} (cap {settings.MAX_RISK_PER_TRADE:.2%})",
+        f"max open positions: {settings.MAX_OPEN_POSITIONS}",
+        f"daily loss limit: {settings.MAX_DAILY_LOSS:.2%}",
+        f"max trades/day: {settings.MAX_TRADES_PER_DAY}",
+        f"max order notional: {settings.MAX_ORDER_NOTIONAL_USDT} USDT",
+        f"max daily notional: {settings.MAX_DAILY_NOTIONAL_USDT} USDT",
+        f"kill switch: {'ACTIVE' if settings.kill_switch_active else 'off'}",
+        f"telegram: {'enabled' if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else 'disabled'}",
+    ]
+
+
+def _print_startup_checklist(settings) -> None:
+    t = Table(title="Startup checklist", show_lines=False)
+    t.add_column("key"); t.add_column("value")
+    for line in _build_startup_checklist(settings):
+        if ": " in line:
+            k, _, v = line.partition(": ")
+            t.add_row(k.strip(), v.strip())
+        else:
+            t.add_row(line, "")
+    console.print(t)
+
+
 # --------------- CLI commands ---------------
 
 @cli.command("run")
@@ -65,9 +103,20 @@ def run_cmd(
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     init_db()
+
+    # Hard gate: refuse to start in live mode without explicit human confirmation.
+    try:
+        settings.assert_live_allowed()
+    except LiveConfirmationMissing as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=2)
+
     tg = build_telegram_from_settings()
     strategy = _build_strategy(settings)
     risk = RiskManager(settings)
+
+    _print_startup_checklist(settings)
+    tg.startup_checklist(_build_startup_checklist(settings))
 
     if settings.is_live:
         console.print("[bold red]LIVE TRADING ENABLED — real funds at risk[/bold red]")
@@ -79,29 +128,40 @@ def run_cmd(
     tg.bot_started(settings.MODE, settings.SYMBOLS)
     repo.log_bot_event("bot_started", f"mode={settings.MODE} live={settings.is_live}")
 
-    stop = {"flag": False}
+    state = {"stop": False, "last_heartbeat": utc_now()}
 
     def _handle(_sig, _frame):
-        stop["flag"] = True
+        state["stop"] = True
         log_event(logger, "info", "shutdown_requested")
 
     os_signal.signal(os_signal.SIGINT, _handle)
     os_signal.signal(os_signal.SIGTERM, _handle)
 
     try:
-        while not stop["flag"]:
+        while not state["stop"]:
             cycle_start = time.time()
             try:
                 _cycle(settings, exchange, strategy, risk, om, tg)
             except Exception as exc:
                 log_event(logger, "error", "cycle_error", err=str(exc))
                 tg.exchange_error(str(exc))
+
+            # Heartbeat
+            if (utc_now() - state["last_heartbeat"]) >= timedelta(hours=settings.HEARTBEAT_HOURS):
+                tg.heartbeat(
+                    settings.MODE,
+                    len(repo.get_open_positions()),
+                    repo.daily_pnl_pct(settings.ACCOUNT_EQUITY),
+                    settings.kill_switch_active,
+                )
+                state["last_heartbeat"] = utc_now()
+
             if once:
                 break
             elapsed = time.time() - cycle_start
             sleep_for = max(1.0, settings.LOOP_INTERVAL_SECONDS - elapsed)
             for _ in range(int(sleep_for)):
-                if stop["flag"]:
+                if state["stop"]:
                     break
                 time.sleep(1)
     finally:
@@ -110,25 +170,28 @@ def run_cmd(
 
 
 def _cycle(settings, exchange, strategy, risk, om, tg) -> None:
-    # 1. kill switch check
     if settings.kill_switch_active:
         log_event(logger, "warning", "kill_switch_active")
         tg.kill_switch()
-        # Still manage existing positions if user opted in
         if not settings.KILL_SWITCH_CLOSE_POSITIONS:
             return
 
-    # 2. fetch candles per symbol, in one place to limit API calls
     needed = max(200, settings.BREAKOUT_LOOKBACK + 60)
     market_data: dict[str, pd.DataFrame] = {}
-    for sym in settings.SYMBOLS:
+    symbols_to_fetch = list(settings.SYMBOLS)
+    # Ensure BTC/USDT is loaded when ETH or SOL needs the market filter.
+    needs_btc = any(s.upper() in ("ETH/USDT", "SOL/USDT") for s in settings.SYMBOLS)
+    if needs_btc and "BTC/USDT" not in symbols_to_fetch:
+        symbols_to_fetch.append("BTC/USDT")
+    for sym in symbols_to_fetch:
         ohlcv = exchange.fetch_ohlcv(sym, settings.TIMEFRAME, limit=needed)
         market_data[sym] = _df_from_ohlcv(ohlcv)
 
     # 3. manage existing positions
-    for sym, df in market_data.items():
+    for sym in settings.SYMBOLS:
+        df = market_data.get(sym)
         pos = repo.open_position_for_symbol(sym)
-        if pos is None or df.empty:
+        if pos is None or df is None or df.empty:
             continue
         last_close = float(df["close"].iloc[-1])
         ema20_series = ema(df["close"], 20)
@@ -136,8 +199,16 @@ def _cycle(settings, exchange, strategy, risk, om, tg) -> None:
         om.manage_position(pos, last_close, ema20_val)
 
     # 4. signals
-    for sym, df in market_data.items():
-        context = {"BTC/USDT": market_data.get("BTC/USDT")}
+    btc_df = market_data.get("BTC/USDT")
+    balance_fetcher = None
+    if settings.is_live and hasattr(om.broker, "free_quote"):
+        balance_fetcher = om.broker.free_quote
+
+    for sym in settings.SYMBOLS:
+        df = market_data.get(sym)
+        if df is None:
+            continue
+        context = {"BTC/USDT": btc_df}
         sig = strategy.generate_signal(sym, df, context=context)
         if sig is None:
             continue
@@ -147,15 +218,11 @@ def _cycle(settings, exchange, strategy, risk, om, tg) -> None:
             "stop_loss": sig.stop_loss, "take_profit_1": sig.take_profit_1,
             "take_profit_2": sig.take_profit_2, "strategy_name": sig.strategy_name,
         })
-        decision = risk.evaluate(sig)
+        decision = risk.evaluate(sig, balance_fetcher=balance_fetcher)
         repo.save_signal(
-            symbol=sig.symbol,
-            side=sig.side,
-            strategy_name=sig.strategy_name,
-            price=sig.price,
-            raw=sig.raw,
-            accepted=decision.approved,
-            rejection_reason=decision.reason,
+            symbol=sig.symbol, side=sig.side, strategy_name=sig.strategy_name,
+            price=sig.price, raw=sig.raw,
+            accepted=decision.approved, rejection_reason=decision.reason,
         )
         if not decision.approved:
             log_event(logger, "warning", "signal_rejected", symbol=sym, reason=decision.reason)
@@ -171,7 +238,6 @@ def backtest_cmd(
     days: int = typer.Option(90, "--days"),
     out_dir: str = typer.Option("./data/backtests", "--out"),
 ):
-    """Run a historical backtest."""
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     init_db()
@@ -184,7 +250,6 @@ def backtest_cmd(
 
 @cli.command("status")
 def status_cmd():
-    """Show bot status."""
     settings = reload_settings()
     configure_logging(settings.LOG_LEVEL)
     init_db()
@@ -192,6 +257,7 @@ def status_cmd():
     t.add_column("Key"); t.add_column("Value")
     t.add_row("MODE", settings.MODE)
     t.add_row("LIVE_TRADING", str(settings.LIVE_TRADING))
+    t.add_row("I_UNDERSTAND_THIS_CAN_LOSE_MONEY", str(settings.I_UNDERSTAND_THIS_CAN_LOSE_MONEY))
     t.add_row("Effective live?", str(settings.is_live))
     t.add_row("Kill switch", "ACTIVE" if settings.kill_switch_active else "off")
     t.add_row("Symbols", ", ".join(settings.SYMBOLS))
@@ -199,13 +265,13 @@ def status_cmd():
     t.add_row("Open positions", str(len(repo.get_open_positions())))
     t.add_row("Trades today", str(repo.trades_today_count()))
     t.add_row("Daily PnL %", f"{repo.daily_pnl_pct(settings.ACCOUNT_EQUITY):.2%}")
+    t.add_row("Daily notional (USDT)", f"{repo.daily_traded_notional():.2f}")
     t.add_row("Consec losses", str(repo.consecutive_losses()))
     console.print(t)
 
 
 @cli.command("positions")
 def positions_cmd():
-    """Show open positions."""
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     init_db()
@@ -226,7 +292,6 @@ def positions_cmd():
 
 @cli.command("trades")
 def trades_cmd(limit: int = typer.Option(20, "--limit")):
-    """Show last trades."""
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     init_db()
@@ -249,7 +314,6 @@ def trades_cmd(limit: int = typer.Option(20, "--limit")):
 
 @cli.command("kill")
 def kill_cmd():
-    """Create the kill switch file."""
     KILL_SWITCH_FILE.write_text("kill")
     init_db()
     repo.log_bot_event("kill_switch_created", "kill switch file created", severity="warning")
@@ -258,7 +322,6 @@ def kill_cmd():
 
 @cli.command("unkill")
 def unkill_cmd():
-    """Remove the kill switch file."""
     if KILL_SWITCH_FILE.exists():
         KILL_SWITCH_FILE.unlink()
         init_db()
@@ -270,14 +333,12 @@ def unkill_cmd():
 
 @cli.command("check-config")
 def check_config_cmd():
-    """Print effective config (secrets redacted)."""
     s = reload_settings()
     console.print_json(json.dumps(s.safe_dump(), default=str))
 
 
 @cli.command("webhook")
 def webhook_cmd(host: str = "0.0.0.0", port: int = 8000):
-    """Run FastAPI webhook server."""
     import uvicorn
     uvicorn.run("app.webhooks.tradingview:app", host=host, port=port, reload=False)
 

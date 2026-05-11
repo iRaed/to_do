@@ -1,16 +1,18 @@
-"""Time helpers (UTC-first)."""
+"""Time helpers. We use *naive UTC* everywhere so SQLite DateTime columns
+compare cleanly. The whole app is UTC; nothing else is supported."""
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 
 
 def utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    """Naive UTC datetime."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def utc_today_start() -> datetime:
-    now = utc_now()
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    n = utc_now()
+    return n.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def timeframe_to_minutes(tf: str) -> int:
@@ -30,3 +32,7 @@ def candles_since(days: int, tf: str) -> int:
 
 def minutes_ago(minutes: int) -> datetime:
     return utc_now() - timedelta(minutes=minutes)
+
+
+def seconds_since(then: datetime) -> float:
+    return (utc_now() - then).total_seconds()

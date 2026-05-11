@@ -1,8 +1,10 @@
-"""Live broker. Active ONLY when MODE=live AND LIVE_TRADING=true.
+"""Live broker. Active ONLY when MODE=live AND LIVE_TRADING=true AND
+I_UNDERSTAND_THIS_CAN_LOSE_MONEY=true (gated by Settings.is_live).
 
 Safety contract:
 - Validates API connectivity and credentials on init.
 - Validates symbol, balance, notional, and risk-manager approval before any order.
+- Re-fetches balance immediately before placing the order.
 - Uses market orders only in v1.
 - Never blindly retries; on unknown state, refuses to submit a duplicate.
 """
@@ -41,6 +43,8 @@ class LiveBroker:
     mode = "live"
 
     def __init__(self, settings: Settings, exchange: ExchangeBase):
+        # Defence-in-depth: assert all three gates before we even touch the exchange.
+        settings.assert_live_allowed()
         if not settings.is_live:
             raise LiveTradingDisabled("LIVE_TRADING is not enabled. Refusing to instantiate LiveBroker.")
         if not (settings.BINANCE_API_KEY and settings.BINANCE_API_SECRET):
@@ -49,6 +53,11 @@ class LiveBroker:
         self.x = exchange
         if not self.x.health_check():
             raise LiveTradingDisabled("Exchange health check failed.")
+
+    # Used by RiskManager as a callable balance fetcher
+    def free_quote(self, quote: str) -> float:
+        bal = self.x.fetch_balance()
+        return float(bal.get(quote, 0.0))
 
     def _validate(self, signal: Signal, quantity: float) -> Optional[str]:
         if signal.symbol not in self.s.SYMBOLS:
@@ -63,6 +72,8 @@ class LiveBroker:
             return "notional_below_exchange_min"
         if quantity < info.min_amount:
             return "amount_below_exchange_min"
+        if notional > self.s.MAX_ORDER_NOTIONAL_USDT:
+            return "order_notional_exceeds_max"
         try:
             bal = self.x.fetch_balance()
         except Exception as exc:
@@ -93,33 +104,21 @@ class LiveBroker:
         try:
             result = self.x.create_market_buy_order(signal.symbol, quantity)
         except Exception as exc:
-            # Never retry blindly: log and bail.
             logger.error("live_order_error", extra={"err": str(exc), "symbol": signal.symbol})
             repo.save_order(
-                symbol=signal.symbol,
-                side="buy",
-                status="error",
-                mode=self.mode,
-                order_type="market",
-                price=signal.price,
-                quantity=quantity,
+                symbol=signal.symbol, side="buy", status="error", mode=self.mode,
+                order_type="market", price=signal.price, quantity=quantity,
                 reason=f"exception:{type(exc).__name__}",
             )
             return None
 
         if result.status not in ("closed", "filled"):
-            # Unknown / partially filled — do NOT submit a duplicate order.
             logger.error("live_order_unknown_state", extra={"status": result.status, "id": result.id})
             repo.save_order(
-                symbol=signal.symbol,
-                side="buy",
-                status=f"unknown:{result.status}",
-                mode=self.mode,
-                order_type="market",
-                price=result.price or signal.price,
-                quantity=result.filled or quantity,
-                fees=result.fees,
-                exchange_order_id=result.id,
+                symbol=signal.symbol, side="buy", status=f"unknown:{result.status}",
+                mode=self.mode, order_type="market",
+                price=result.price or signal.price, quantity=result.filled or quantity,
+                fees=result.fees, exchange_order_id=result.id,
                 reason="unknown_state_no_retry",
             )
             return None
@@ -129,55 +128,28 @@ class LiveBroker:
         fees = float(result.fees or 0.0)
 
         trade_id = repo.create_trade(
-            symbol=signal.symbol,
-            side="buy",
-            status="open",
-            mode=self.mode,
-            entry_price=fill_price,
-            quantity=filled_qty,
-            stop_loss=signal.stop_loss,
-            take_profit_1=signal.take_profit_1,
-            take_profit_2=signal.take_profit_2,
-            fees=fees,
+            symbol=signal.symbol, side="buy", status="open", mode=self.mode,
+            entry_price=fill_price, quantity=filled_qty,
+            stop_loss=signal.stop_loss, take_profit_1=signal.take_profit_1,
+            take_profit_2=signal.take_profit_2, fees=fees,
             strategy_name=signal.strategy_name,
             raw_signal_json=json.dumps(signal.raw, default=str),
         )
         order_id = repo.save_order(
-            symbol=signal.symbol,
-            side="buy",
-            status="filled",
-            mode=self.mode,
-            order_type="market",
-            price=fill_price,
-            quantity=filled_qty,
-            fees=fees,
-            exchange_order_id=result.id,
-            trade_id=trade_id,
-            reason="entry",
+            symbol=signal.symbol, side="buy", status="filled", mode=self.mode,
+            order_type="market", price=fill_price, quantity=filled_qty, fees=fees,
+            exchange_order_id=result.id, trade_id=trade_id, reason="entry",
         )
         position_id = repo.create_position(
-            symbol=signal.symbol,
-            side="long",
-            status="open",
-            mode=self.mode,
-            entry_price=fill_price,
-            quantity=filled_qty,
-            stop_loss=signal.stop_loss,
-            take_profit_1=signal.take_profit_1,
+            symbol=signal.symbol, side="long", status="open", mode=self.mode,
+            entry_price=fill_price, quantity=filled_qty,
+            stop_loss=signal.stop_loss, take_profit_1=signal.take_profit_1,
             take_profit_2=signal.take_profit_2,
-            trade_id=trade_id,
-            strategy_name=signal.strategy_name,
+            trade_id=trade_id, strategy_name=signal.strategy_name,
         )
-        log_event(
-            logger,
-            "info",
-            "live_fill_open",
-            symbol=signal.symbol,
-            price=fill_price,
-            qty=filled_qty,
-            fees=fees,
-            exchange_order_id=result.id,
-        )
+        log_event(logger, "info", "live_fill_open",
+                  symbol=signal.symbol, price=fill_price, qty=filled_qty,
+                  fees=fees, exchange_order_id=result.id)
         return LiveFillResult(fill_price, filled_qty, fees, order_id, trade_id, position_id, result.id)
 
     def close_long(self, position_id: int, trade_id: int, symbol: str, quantity: float, reason: str) -> Optional[float]:
@@ -187,35 +159,29 @@ class LiveBroker:
         except Exception as exc:
             logger.error("live_exit_error", extra={"err": str(exc), "symbol": symbol})
             repo.save_order(
-                symbol=symbol,
-                side="sell",
-                status="error",
-                mode=self.mode,
-                order_type="market",
-                price=0.0,
-                quantity=quantity,
-                trade_id=trade_id,
+                symbol=symbol, side="sell", status="error", mode=self.mode,
+                order_type="market", price=0.0, quantity=quantity, trade_id=trade_id,
                 reason=f"exit_exception:{type(exc).__name__}",
             )
             return None
         if result.status not in ("closed", "filled"):
             logger.error("live_exit_unknown_state", extra={"status": result.status, "id": result.id})
+            repo.save_order(
+                symbol=symbol, side="sell", status=f"unknown:{result.status}", mode=self.mode,
+                order_type="market", price=result.price or 0.0,
+                quantity=result.filled or quantity, fees=result.fees,
+                exchange_order_id=result.id, trade_id=trade_id,
+                reason="unknown_state_no_retry",
+            )
             return None
 
         fill_price = float(result.price or 0.0)
         fees = float(result.fees or 0.0)
         repo.save_order(
-            symbol=symbol,
-            side="sell",
-            status="filled",
-            mode=self.mode,
-            order_type="market",
-            price=fill_price,
-            quantity=float(result.filled or quantity),
-            fees=fees,
-            exchange_order_id=result.id,
-            trade_id=trade_id,
-            reason=reason,
+            symbol=symbol, side="sell", status="filled", mode=self.mode,
+            order_type="market", price=fill_price,
+            quantity=float(result.filled or quantity), fees=fees,
+            exchange_order_id=result.id, trade_id=trade_id, reason=reason,
         )
 
         from ..storage.db import session_scope
@@ -228,12 +194,8 @@ class LiveBroker:
         pnl = (fill_price - entry) * quantity - entry_fees - fees
         pnl_pct = pnl / max(entry * quantity, 1e-9)
         repo.close_trade(
-            trade_id,
-            exit_price=fill_price,
-            realized_pnl=pnl,
-            realized_pnl_pct=pnl_pct,
-            fees=fees,
-            reason=reason,
+            trade_id, exit_price=fill_price, realized_pnl=pnl,
+            realized_pnl_pct=pnl_pct, fees=fees, reason=reason,
         )
         repo.close_position(position_id)
         return pnl

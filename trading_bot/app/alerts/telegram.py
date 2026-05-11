@@ -1,7 +1,7 @@
 """Telegram alerts. Silently noop if credentials are missing."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
 import httpx
 
@@ -37,23 +37,29 @@ class TelegramNotifier:
             logger.warning("telegram_exception", extra={"err": str(exc)})
             return False
 
-    # ---- High level helpers (concise messages, no secrets) ----
+    # ---- High level helpers ----
 
-    def bot_started(self, mode: str, symbols: list[str]) -> None:
+    def bot_started(self, mode: str, symbols: List[str]) -> None:
         self.send(f"*Bot started* mode={mode} symbols={','.join(symbols)}")
 
     def bot_stopped(self, reason: str = "manual") -> None:
         self.send(f"*Bot stopped* reason={reason}")
 
+    def startup_checklist(self, lines: List[str]) -> None:
+        body = "\n".join(f"• {l}" for l in lines)
+        self.send(f"*Startup checklist*\n{body}")
+
+    def heartbeat(self, mode: str, open_positions: int, daily_pnl_pct: float, kill: bool) -> None:
+        ks = " | KILL_SWITCH" if kill else ""
+        self.send(
+            f"*Heartbeat* mode={mode} open={open_positions} dailyPnL={daily_pnl_pct:.2%}{ks}"
+        )
+
     def signal_detected(self, sig: Dict[str, Any]) -> None:
         self.send(
             "*Signal* {symbol} {side} @ {price}\nSL: {sl}  TP1: {tp1}  TP2: {tp2}\nStrategy: {strat}".format(
-                symbol=sig.get("symbol"),
-                side=sig.get("side"),
-                price=sig.get("price"),
-                sl=sig.get("stop_loss"),
-                tp1=sig.get("take_profit_1"),
-                tp2=sig.get("take_profit_2"),
+                symbol=sig.get("symbol"), side=sig.get("side"), price=sig.get("price"),
+                sl=sig.get("stop_loss"), tp1=sig.get("take_profit_1"), tp2=sig.get("take_profit_2"),
                 strat=sig.get("strategy_name"),
             )
         )
@@ -61,9 +67,11 @@ class TelegramNotifier:
     def signal_rejected(self, symbol: str, reason: str) -> None:
         self.send(f"*Signal rejected* {symbol} reason={reason}")
 
-    def trade_opened(self, mode: str, symbol: str, price: float, qty: float, sl: float, tp1: float, tp2: float, risk: float) -> None:
+    def trade_opened(self, mode: str, symbol: str, price: float, qty: float,
+                     sl: float, tp1: float, tp2: float, risk: float) -> None:
         self.send(
-            f"*{mode.upper()} BUY* {symbol}\nPrice: {price}  Qty: {qty}\nSL: {sl}  TP1: {tp1}  TP2: {tp2}\nRisk: {risk:.2%}"
+            f"*{mode.upper()} BUY* {symbol}\nPrice: {price}  Qty: {qty}\n"
+            f"SL: {sl}  TP1: {tp1}  TP2: {tp2}\nRisk: {risk:.2%}"
         )
 
     def exit_event(self, event: str, symbol: str, price: float, pnl: float, pnl_pct: float) -> None:
